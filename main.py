@@ -7,7 +7,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import init_db, set_db_path, execute_query, execute_update
-from db_init import init_and_seed
+from db_init import init_and_seed, reset_db
 from scheduler import ContractMonitorScheduler
 from contract_scanner import (
     scan_active_contracts, get_upcoming_payment_milestones,
@@ -27,10 +27,11 @@ from audit_log import log_operation, query_logs, batch_export_logs, get_log_stat
 
 
 def cmd_init(args):
-    logging.info("Initializing database with sample data...")
     num_contracts = args.contracts or 500
     num_customers = args.customers or 50
-    init_and_seed(num_contracts, num_customers)
+    if args.reset:
+        logging.info("Reset mode: clearing existing database and rebuilding...")
+    init_and_seed(num_contracts, num_customers, reset=args.reset)
     logging.info(f"Database initialized with {num_contracts} contracts and {num_customers} customers")
 
 
@@ -220,6 +221,100 @@ def cmd_dashboard(args):
     print("\n" + "=" * 60)
 
 
+def cmd_customers(args):
+    scheduler = ContractMonitorScheduler(args.config)
+
+    filters = []
+    params = []
+
+    if args.credit_level:
+        levels = args.credit_level.split(",")
+        placeholders = ",".join(["?"] * len(levels))
+        filters.append(f"cu.credit_level IN ({placeholders})")
+        params.extend(levels)
+
+    if args.manager:
+        filters.append("c.sales_manager = ?")
+        params.append(args.manager)
+
+    if args.min_overdue:
+        filters.append("overdue_amt >= ?")
+        params.append(float(args.min_overdue))
+
+    where_clause = ""
+    if filters:
+        where_clause = "WHERE " + " AND ".join(filters)
+
+    sql = (
+        "SELECT cu.customer_id, cu.customer_name, cu.credit_level, cu.credit_score, "
+        "cu.order_frozen, cu.overdue_count, "
+        "COUNT(DISTINCT c.contract_id) as contract_count, "
+        "COALESCE(SUM(CASE WHEN m.milestone_type = 'payment' "
+        "  AND m.status IN ('pending', 'upcoming_due') THEN m.amount ELSE 0 END), 0) as pending_amount, "
+        "COALESCE(SUM(CASE WHEN m.milestone_type = 'payment' "
+        "  AND m.status = 'overdue' THEN m.amount ELSE 0 END), 0) as overdue_amt "
+        "FROM customers cu "
+        "LEFT JOIN contracts c ON cu.customer_id = c.customer_id AND c.status = 'active' "
+        "LEFT JOIN milestones m ON cu.customer_id = m.customer_id AND m.milestone_type = 'payment' "
+        f"{where_clause} "
+        "GROUP BY cu.customer_id "
+        "ORDER BY overdue_amt DESC"
+    )
+    customer_rows = execute_query(sql, params, fetch_all=True)
+
+    customer_ids = [r["customer_id"] for r in customer_rows]
+
+    last_reminder_map = {}
+    if customer_ids:
+        placeholders = ",".join(["?"] * len(customer_ids))
+        reminders = execute_query(
+            f"SELECT customer_id, MAX(created_at) as last_reminder "
+            f"FROM collection_reminders "
+            f"WHERE customer_id IN ({placeholders}) "
+            f"GROUP BY customer_id",
+            customer_ids,
+            fetch_all=True
+        )
+        last_reminder_map = {r["customer_id"]: r["last_reminder"] for r in reminders}
+
+    print("\n" + "=" * 100)
+    print("  CUSTOMER OVERVIEW")
+    print("=" * 100)
+
+    if args.credit_level:
+        print(f"  Filter: Credit Level = {args.credit_level}")
+    if args.manager:
+        print(f"  Filter: Sales Manager = {args.manager}")
+    if args.min_overdue:
+        print(f"  Filter: Min Overdue Amount = ¥{float(args.min_overdue):,.2f}")
+
+    print(f"  Total customers: {len(customer_rows)}")
+    print()
+
+    header = f"{'ID':<12} {'Customer':<20} {'Credit':<7} {'Score':<6} {'Contracts':<10} " \
+             f"{'Pending(¥)':<14} {'Overdue(¥)':<14} {'Frozen':<7} {'Last Reminder':<20}"
+    print(header)
+    print("-" * 100)
+
+    for r in customer_rows:
+        frozen_str = "YES" if r["order_frozen"] else "no"
+        last_rem = last_reminder_map.get(r["customer_id"], "-")
+        line = f"{r['customer_id']:<12} {r['customer_name']:<20} {r['credit_level']:<7} " \
+               f"{r['credit_score']:<6} {r['contract_count']:<10} " \
+               f"{r['pending_amount']:>12,.2f} {r['overdue_amt']:>12,.2f} " \
+               f"{frozen_str:<7} {last_rem:<20}"
+        print(line)
+
+    total_pending = sum(r["pending_amount"] for r in customer_rows)
+    total_overdue = sum(r["overdue_amt"] for r in customer_rows)
+    frozen_count = sum(1 for r in customer_rows if r["order_frozen"])
+
+    print("-" * 100)
+    print(f"{'TOTAL':<12} {'':<20} {'':<7} {'':<6} {len(customer_rows):<10} "
+          f"{total_pending:>12,.2f} {total_overdue:>12,.2f} {frozen_count:<7}")
+    print("=" * 100)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Contract Fulfillment Monitoring & Intelligent Collection System"
@@ -231,6 +326,7 @@ def main():
     p_init = subparsers.add_parser("init", help="Initialize database with sample data")
     p_init.add_argument("--contracts", type=int, default=500, help="Number of sample contracts")
     p_init.add_argument("--customers", type=int, default=50, help="Number of sample customers")
+    p_init.add_argument("--reset", action="store_true", help="Reset database before seeding (clean rebuild)")
 
     p_scan = subparsers.add_parser("scan", help="Run daily contract scan")
     p_reconcile = subparsers.add_parser("reconcile", help="Run bank reconciliation")
@@ -273,6 +369,11 @@ def main():
     p_full = subparsers.add_parser("full", help="Run full daily workflow")
     p_dashboard = subparsers.add_parser("dashboard", help="Show monitoring dashboard")
 
+    p_customers = subparsers.add_parser("customers", help="Customer overview with filters")
+    p_customers.add_argument("--credit-level", help="Filter by credit level(s), e.g. A,B or C,D")
+    p_customers.add_argument("--manager", help="Filter by sales manager name")
+    p_customers.add_argument("--min-overdue", help="Filter by minimum overdue amount")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -291,6 +392,7 @@ def main():
         "logs": cmd_logs,
         "full": cmd_full,
         "dashboard": cmd_dashboard,
+        "customers": cmd_customers,
     }
 
     if args.command in commands:

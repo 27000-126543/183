@@ -20,45 +20,74 @@ def generate_collection_reminders(upcoming_milestones, config):
     generated = 0
 
     for m in upcoming_milestones:
-        existing = execute_query(
+        credit_level = m.get("credit_level", "B")
+        if credit_level in high_credit:
+            customer_type = "gentle_email"
+            customer_content = gentle_template.format(
+                customer_name=m.get("customer_name", ""),
+                contract_no=m.get("contract_no", ""),
+                description=m.get("description", ""),
+                amount=m.get("amount", 0),
+                due_date=m.get("planned_date", "")
+            )
+        else:
+            customer_type = "firm_letter"
+            customer_content = firm_template.format(
+                customer_name=m.get("customer_name", ""),
+                contract_no=m.get("contract_no", ""),
+                description=m.get("description", ""),
+                amount=m.get("amount", 0),
+                due_date=m.get("planned_date", "")
+            )
+        customer_recipient = m.get("contact_email", "")
+
+        cust_name = m.get('customer_name', '')
+        contract_no = m.get('contract_no', '')
+        desc = m.get('description', '')
+        amount = m.get('amount', 0)
+        due = m.get('planned_date', '')
+        method = '温和邮件' if customer_type == 'gentle_email' else '强硬信函'
+        manager_content = (
+            f"【待跟进提醒】客户{cust_name}合同{contract_no}"
+            + f"付款里程碑\"{desc}\"（金额：{amount}元）"
+            + f"将于{due}到期，请及时跟进催收。"
+            + f"客户信用等级：{credit_level}，催收方式：{method}。"
+        )
+        manager_recipient = m.get("sales_manager", "")
+
+        existing_customer = execute_query(
             "SELECT reminder_id FROM collection_reminders "
-            "WHERE milestone_id = ? AND status IN ('pending', 'sent') "
+            "WHERE milestone_id = ? AND reminder_type = ? "
+            "AND status IN ('pending', 'sent') "
+            "AND date(created_at) = date('now','localtime')",
+            [m["milestone_id"], customer_type],
+            fetch_one=True
+        )
+        if not existing_customer:
+            reminder_id = f"RMD{uuid.uuid4().hex[:12]}"
+            reminders.append((
+                reminder_id, m["contract_id"], m["customer_id"], m["milestone_id"],
+                customer_type, customer_content, customer_recipient, None, "pending",
+                datetime.now().isoformat()
+            ))
+            generated += 1
+
+        existing_manager = execute_query(
+            "SELECT reminder_id FROM collection_reminders "
+            "WHERE milestone_id = ? AND reminder_type = 'manager_notification' "
+            "AND status IN ('pending', 'sent') "
             "AND date(created_at) = date('now','localtime')",
             [m["milestone_id"]],
             fetch_one=True
         )
-        if existing:
-            continue
-
-        credit_level = m.get("credit_level", "B")
-        reminder_type = "gentle_email" if credit_level in high_credit else "firm_letter"
-
-        if reminder_type == "gentle_email":
-            content = gentle_template.format(
-                customer_name=m.get("customer_name", ""),
-                contract_no=m.get("contract_no", ""),
-                description=m.get("description", ""),
-                amount=m.get("amount", 0),
-                due_date=m.get("planned_date", "")
-            )
-            recipient = m.get("contact_email", "")
-        else:
-            content = firm_template.format(
-                customer_name=m.get("customer_name", ""),
-                contract_no=m.get("contract_no", ""),
-                description=m.get("description", ""),
-                amount=m.get("amount", 0),
-                due_date=m.get("planned_date", "")
-            )
-            recipient = m.get("sales_manager", "")
-
-        reminder_id = f"RMD{uuid.uuid4().hex[:12]}"
-        reminders.append((
-            reminder_id, m["contract_id"], m["customer_id"], m["milestone_id"],
-            reminder_type, content, recipient, None, "pending",
-            datetime.now().isoformat()
-        ))
-        generated += 1
+        if not existing_manager:
+            manager_id = f"RMD{uuid.uuid4().hex[:12]}"
+            reminders.append((
+                manager_id, m["contract_id"], m["customer_id"], m["milestone_id"],
+                "manager_notification", manager_content, manager_recipient, None, "pending",
+                datetime.now().isoformat()
+            ))
+            generated += 1
 
     if reminders:
         execute_many(

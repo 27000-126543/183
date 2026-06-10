@@ -70,10 +70,10 @@ def batch_update_scores_from_payments(config=None):
         config = {}
 
     completed_payments = execute_query(
-        "SELECT m.customer_id, m.overdue_days "
-        "FROM milestones m "
-        "WHERE m.milestone_type = 'payment' AND m.status = 'completed' "
-        "AND date(m.updated_at) = date('now','localtime')",
+        "SELECT milestone_id, customer_id, overdue_days "
+        "FROM milestones "
+        "WHERE milestone_type = 'payment' AND status = 'completed' "
+        "AND credit_scored = 0",
         fetch_all=True
     )
 
@@ -88,6 +88,10 @@ def batch_update_scores_from_payments(config=None):
 
         result = update_credit_score(p["customer_id"], event, config)
         if result:
+            execute_update(
+                "UPDATE milestones SET credit_scored = 1, updated_at = ? WHERE milestone_id = ?",
+                [datetime.now().isoformat(), p["milestone_id"]]
+            )
             results.append(result)
 
     logger.info(f"Batch credit score update: {len(results)} customers updated")

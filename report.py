@@ -85,16 +85,18 @@ def generate_monthly_report(year=None, month=None, config=None):
 def _compute_report_stats(start_date, end_date):
     total_payment_milestones = execute_query(
         "SELECT COUNT(*) as cnt FROM milestones "
-        "WHERE milestone_type = 'payment' AND created_at < ?",
-        [end_date],
+        "WHERE milestone_type = 'payment' "
+        "AND planned_date >= ? AND planned_date < ?",
+        [start_date, end_date],
         fetch_one=True
     )
 
     completed_on_time = execute_query(
         "SELECT COUNT(*) as cnt FROM milestones "
         "WHERE milestone_type = 'payment' AND status = 'completed' "
-        "AND overdue_days = 0 AND created_at < ?",
-        [end_date],
+        "AND overdue_days = 0 "
+        "AND actual_date >= ? AND actual_date < ?",
+        [start_date, end_date],
         fetch_one=True
     )
 
@@ -102,8 +104,9 @@ def _compute_report_stats(start_date, end_date):
         "SELECT COUNT(*) as cnt, AVG(overdue_days) as avg_days "
         "FROM milestones "
         "WHERE milestone_type = 'payment' AND status = 'completed' "
-        "AND overdue_days > 0 AND created_at < ?",
-        [end_date],
+        "AND overdue_days > 0 "
+        "AND actual_date >= ? AND actual_date < ?",
+        [start_date, end_date],
         fetch_one=True
     )
 
@@ -111,8 +114,8 @@ def _compute_report_stats(start_date, end_date):
         "SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total "
         "FROM milestones "
         "WHERE milestone_type = 'payment' AND status = 'overdue' "
-        "AND created_at < ?",
-        [end_date],
+        "AND planned_date >= ? AND planned_date < ?",
+        [start_date, end_date],
         fetch_one=True
     )
 
@@ -120,16 +123,25 @@ def _compute_report_stats(start_date, end_date):
     on_time_rate = (completed_on_time["cnt"] or 0) / max(total_completed, 1) * 100
     avg_overdue_days = completed_late["avg_days"] or 0
 
-    total_amount = execute_query(
+    total_planned_amount = execute_query(
         "SELECT COALESCE(SUM(amount), 0) as total FROM milestones "
-        "WHERE milestone_type = 'payment'",
+        "WHERE milestone_type = 'payment' "
+        "AND planned_date >= ? AND planned_date < ?",
+        [start_date, end_date],
         fetch_one=True
     )
 
-    bad_debt_rate = (overdue["total"] or 0) / max(total_amount["total"] or 1, 1) * 100
+    bad_debt_rate = (overdue["total"] or 0) / max(total_planned_amount["total"] or 1, 1) * 100
 
     credit_dist = execute_query(
-        "SELECT credit_level, COUNT(*) as cnt FROM customers GROUP BY credit_level ORDER BY credit_level",
+        "SELECT cu.credit_level, COUNT(DISTINCT cu.customer_id) as cnt "
+        "FROM customers cu "
+        "JOIN milestones m ON cu.customer_id = m.customer_id "
+        "WHERE m.milestone_type = 'payment' "
+        "AND (m.planned_date >= ? AND m.planned_date < ? "
+        "     OR (m.actual_date >= ? AND m.actual_date < ?)) "
+        "GROUP BY cu.credit_level ORDER BY cu.credit_level",
+        [start_date, end_date, start_date, end_date],
         fetch_all=True
     )
 
@@ -141,8 +153,10 @@ def _compute_report_stats(start_date, end_date):
         "FROM customers cu "
         "JOIN milestones m ON cu.customer_id = m.customer_id "
         "WHERE m.status = 'overdue' AND m.milestone_type = 'payment' "
+        "AND m.planned_date >= ? AND m.planned_date < ? "
         "GROUP BY cu.customer_id "
         "ORDER BY overdue_total DESC LIMIT 10",
+        [start_date, end_date],
         fetch_all=True
     )
 
@@ -165,7 +179,7 @@ def _compute_report_stats(start_date, end_date):
         m_overdue = execute_query(
             "SELECT COUNT(*) as cnt FROM milestones "
             "WHERE milestone_type = 'payment' AND status = 'overdue' "
-            "AND updated_at >= ? AND updated_at < ?",
+            "AND planned_date >= ? AND planned_date < ?",
             [m_start, m_end],
             fetch_one=True
         )
@@ -176,6 +190,42 @@ def _compute_report_stats(start_date, end_date):
         })
 
     monthly_trend.reverse()
+
+    planned_details = execute_query(
+        "SELECT m.contract_no, cu.customer_name, m.description, "
+        "m.planned_date, m.actual_date, m.amount, m.overdue_days, m.status "
+        "FROM milestones m "
+        "JOIN customers cu ON m.customer_id = cu.customer_id "
+        "WHERE m.milestone_type = 'payment' "
+        "AND m.planned_date >= ? AND m.planned_date < ? "
+        "ORDER BY m.planned_date ASC",
+        [start_date, end_date],
+        fetch_all=True
+    )
+
+    actual_details = execute_query(
+        "SELECT m.contract_no, cu.customer_name, m.description, "
+        "m.planned_date, m.actual_date, m.amount, m.overdue_days, m.status "
+        "FROM milestones m "
+        "JOIN customers cu ON m.customer_id = cu.customer_id "
+        "WHERE m.milestone_type = 'payment' AND m.actual_date IS NOT NULL "
+        "AND m.actual_date >= ? AND m.actual_date < ? "
+        "ORDER BY m.actual_date ASC",
+        [start_date, end_date],
+        fetch_all=True
+    )
+
+    overdue_details = execute_query(
+        "SELECT m.contract_no, cu.customer_name, m.description, "
+        "m.planned_date, m.actual_date, m.amount, m.overdue_days, m.status "
+        "FROM milestones m "
+        "JOIN customers cu ON m.customer_id = cu.customer_id "
+        "WHERE m.milestone_type = 'payment' AND m.status = 'overdue' "
+        "AND m.planned_date >= ? AND m.planned_date < ? "
+        "ORDER BY m.overdue_days DESC",
+        [start_date, end_date],
+        fetch_all=True
+    )
 
     return {
         "on_time_rate": round(on_time_rate, 2),
@@ -188,7 +238,10 @@ def _compute_report_stats(start_date, end_date):
         "overdue_count": overdue["cnt"] or 0,
         "overdue_amount": overdue["total"] or 0,
         "top_overdue_customers": top_overdue_customers,
-        "monthly_trend": monthly_trend
+        "monthly_trend": monthly_trend,
+        "planned_details": planned_details,
+        "actual_details": actual_details,
+        "overdue_details": overdue_details,
     }
 
 
@@ -443,7 +496,46 @@ def _generate_excel_report(stats, year, month, output_dir):
         bar.set_categories(cats)
         ws_trend.add_chart(bar, "E1")
 
+    detail_headers = ["Contract No", "Customer", "Description",
+                      "Planned Date", "Actual Date", "Amount",
+                      "Overdue Days", "Status"]
+    detail_col_widths = [18, 20, 16, 14, 14, 14, 14, 12]
+
+    detail_configs = [
+        ("Planned Payments", stats.get("planned_details", [])),
+        ("Actual Receipts", stats.get("actual_details", [])),
+        ("Overdue Unpaid", stats.get("overdue_details", [])),
+    ]
+
+    for sheet_title, details in detail_configs:
+        ws_detail = wb.create_sheet(sheet_title)
+        ws_detail.append(detail_headers)
+        for cell in ws_detail[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+        for d in details:
+            ws_detail.append([
+                d.get("contract_no", ""),
+                d.get("customer_name", ""),
+                d.get("description", ""),
+                d.get("planned_date", ""),
+                d.get("actual_date", ""),
+                d.get("amount", 0),
+                d.get("overdue_days", 0),
+                d.get("status", ""),
+            ])
+            for cell in ws_detail[ws_detail.max_row]:
+                cell.border = thin_border
+
+        for idx, width in enumerate(detail_col_widths, 1):
+            ws_detail.column_dimensions[chr(64 + idx)].width = width
+
     for ws in wb.worksheets:
+        if ws.title in ("Planned Payments", "Actual Receipts", "Overdue Unpaid"):
+            continue
         for row in ws.iter_rows():
             for cell in row:
                 if cell.value:

@@ -138,8 +138,10 @@ def approve_change(flow_id, approver_id, comments=""):
     if not request:
         raise ValueError("Change request not found")
 
-    if not _validate_approval_conditions(request, flow):
-        raise ValueError("Approval conditions not met for this level")
+    if flow["approver_level"] != request["current_approver_level"]:
+        raise ValueError(f"This approval is not at the current level. "
+                        f"Current level is {request['current_approver_level']}, "
+                        f"but this flow is level {flow['approver_level']}")
 
     now = datetime.now().isoformat()
     execute_update(
@@ -203,6 +205,16 @@ def reject_change(flow_id, approver_id, reason=""):
     )
     if not flow:
         raise ValueError(f"Approval flow {flow_id} not found or already processed")
+
+    request = execute_query(
+        "SELECT * FROM change_requests WHERE request_id = ?",
+        [flow["change_request_id"]],
+        fetch_one=True
+    )
+    if request and flow["approver_level"] != request["current_approver_level"]:
+        raise ValueError(f"This approval is not at the current level. "
+                        f"Current level is {request['current_approver_level']}, "
+                        f"but this flow is level {flow['approver_level']}")
 
     now = datetime.now().isoformat()
     execute_update(
@@ -303,7 +315,8 @@ def get_pending_approvals(role=None, approver_id=None):
     sql = ("SELECT cr.*, af.flow_id, af.approver_level, af.approver_role "
            "FROM change_requests cr "
            "JOIN approval_flows af ON cr.request_id = af.change_request_id "
-           "WHERE cr.approval_status = 'pending' AND af.status = 'pending'")
+           "WHERE cr.approval_status = 'pending' AND af.status = 'pending' "
+           "AND af.approver_level = cr.current_approver_level")
     params = []
     if role:
         sql += " AND af.approver_role = ?"

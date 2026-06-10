@@ -1,8 +1,9 @@
 import uuid
 import random
+import os
 import logging
 from datetime import datetime, timedelta, date
-from models import init_db, execute_query, execute_many, execute_update
+from models import init_db, execute_query, execute_many, execute_update, set_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -11,10 +12,74 @@ def _gen_id(prefix=""):
     return f"{prefix}{uuid.uuid4().hex[:16]}"
 
 
+def reset_db(db_path="./contract_monitor.db"):
+    set_db_path(db_path)
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        logger.info(f"Removed existing database: {db_path}")
+    wal_path = db_path + "-wal"
+    shm_path = db_path + "-shm"
+    for p in [wal_path, shm_path]:
+        if os.path.exists(p):
+            os.remove(p)
+    init_db()
+    logger.info("Database reset complete")
+
+
+def verify_distribution(num_customers):
+    issues = []
+    customer_contract_cnt = execute_query(
+        "SELECT customer_id, COUNT(*) as cnt FROM contracts GROUP BY customer_id",
+        fetch_all=True
+    )
+    if customer_contract_cnt:
+        cnts = [c["cnt"] for c in customer_contract_cnt]
+        avg = sum(cnts) / len(cnts)
+        max_dev = max(abs(c - avg) for c in cnts)
+        if max_dev > 3:
+            issues.append(f"Contract distribution deviation: max {max_dev:.1f} from avg {avg:.1f}")
+
+    customer_ms_cnt = execute_query(
+        "SELECT customer_id, COUNT(*) as cnt FROM milestones "
+        "WHERE milestone_type = 'payment' GROUP BY customer_id",
+        fetch_all=True
+    )
+    if customer_ms_cnt:
+        cnts = [c["cnt"] for c in customer_ms_cnt]
+        avg = sum(cnts) / len(cnts)
+        max_dev = max(abs(c - avg) for c in cnts)
+        if max_dev > avg * 0.5:
+            issues.append(f"Payment milestone distribution deviation: max {max_dev:.1f} from avg {avg:.1f}")
+
+    customer_bank_cnt = execute_query(
+        "SELECT customer_id, COUNT(*) as cnt FROM bank_transactions GROUP BY customer_id",
+        fetch_all=True
+    )
+    if customer_bank_cnt:
+        cnts = [c["cnt"] for c in customer_bank_cnt]
+        avg = sum(cnts) / len(cnts)
+        max_dev = max(abs(c - avg) for c in cnts)
+        if max_dev > avg * 0.5:
+            issues.append(f"Bank transaction distribution deviation: max {max_dev:.1f} from avg {avg:.1f}")
+
+    actual_customers = execute_query(
+        "SELECT COUNT(*) as cnt FROM customers", fetch_one=True
+    )
+    if actual_customers["cnt"] != num_customers:
+        issues.append(f"Customer count mismatch: expected {num_customers}, got {actual_customers['cnt']}")
+
+    if issues:
+        for issue in issues:
+            logger.warning(f"Distribution check: {issue}")
+    else:
+        logger.info("Distribution check passed: all data evenly distributed")
+    return issues
+
+
 def seed_sample_data(num_contracts=200, num_customers=40):
     logger.info(f"Seeding sample data: {num_customers} customers, {num_contracts} contracts")
 
-    customer_names = [
+    base_names = [
         "华远科技有限公司", "盛达实业集团", "中鼎建设有限公司", "鸿运贸易有限公司",
         "瑞丰电子科技", "嘉禾农业集团", "天成新材料公司", "恒信金融服务",
         "博远医疗器械", "宏图建筑设计", "正通物流集团", "万邦化工实业",
@@ -30,16 +95,25 @@ def seed_sample_data(num_contracts=200, num_customers=40):
     credit_weights = [0.25, 0.40, 0.25, 0.10]
 
     customers = []
-    for i in range(min(num_customers, len(customer_names))):
+    for i in range(num_customers):
         cid = f"CUST{i + 1:04d}"
+        if i < len(base_names):
+            name = base_names[i]
+        else:
+            suffixes = ["科技", "实业", "集团", "有限公司", "股份", "控股", "工业", "产业"]
+            prefixes = ["鑫", "龙", "恒", "瑞", "博", "信", "正", "通达", "中盛", "华创",
+                        "新锐", "联创", "宏远", "汇金", "天元", "启明", "永泰", "康盛"]
+            name = f"{prefixes[i % len(prefixes)]}{suffixes[i % len(suffixes)]}" \
+                   f"({chr(65 + (i // 26) % 26)}{i % 26 + 1})"
         cl = random.choices(credit_levels, weights=credit_weights, k=1)[0]
         score = {"A": random.randint(90, 100), "B": random.randint(75, 89),
                  "C": random.randint(60, 74), "D": random.randint(0, 59)}[cl]
+        email_prefix = name.split("(")[0][:2] if "(" in name else name[:2]
         customers.append((
-            cid, customer_names[i], cl, score,
+            cid, name, cl, score,
             random.randint(0, 2), round(random.uniform(0, 300000), 2),
             0, "normal",
-            f"contact@{customer_names[i][:2].lower()}.com",
+            f"contact{i + 1}@{email_prefix.lower()}.com",
             f"138{random.randint(10000000, 99999999)}",
             datetime.now().isoformat(), datetime.now().isoformat()
         ))
@@ -57,8 +131,9 @@ def seed_sample_data(num_contracts=200, num_customers=40):
     contracts = []
     milestones = []
 
+    customer_list = list(customers)
     for i in range(num_contracts):
-        cust = random.choice(customers)
+        cust = customer_list[i % len(customer_list)]
         contract_id = f"CTR{i + 1:06d}"
         contract_no = f"HT-{date.today().year}-{i + 1:05d}"
         sign_date = date.today() - timedelta(days=random.randint(30, 365))
@@ -149,7 +224,7 @@ def seed_sample_data(num_contracts=200, num_customers=40):
 
     bank_txns = []
     for i in range(num_contracts * 3):
-        cust = random.choice(customers)
+        cust = customer_list[i % len(customer_list)]
         txn_id = f"TXN{i + 1:08d}"
         txn_date = date.today() - timedelta(days=random.randint(0, 90))
         amount = round(random.uniform(10000, 2000000), 2)
@@ -167,7 +242,7 @@ def seed_sample_data(num_contracts=200, num_customers=40):
 
     erp_records = []
     for i in range(num_contracts * 2):
-        c = random.choice(contracts)
+        c = contracts[i % len(contracts)]
         rec_id = f"ERP{i + 1:08d}"
         del_date = date.today() - timedelta(days=random.randint(0, 120))
         status = random.choice(["pending", "delivered", "partial"])
@@ -188,9 +263,14 @@ def seed_sample_data(num_contracts=200, num_customers=40):
                 f"{len(milestones)} milestones, {len(bank_txns)} bank txns, {len(erp_records)} ERP records")
 
 
-def init_and_seed(num_contracts=200, num_customers=40):
-    init_db()
+def init_and_seed(num_contracts=200, num_customers=40, reset=False, db_path="./contract_monitor.db"):
+    set_db_path(db_path)
+    if reset:
+        reset_db(db_path)
+    else:
+        init_db()
     seed_sample_data(num_contracts, num_customers)
+    verify_distribution(num_customers)
     logger.info("Database initialization and seeding complete")
 
 
