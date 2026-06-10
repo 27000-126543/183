@@ -1,0 +1,76 @@
+sqlite:
+  db_path: "./contract_monitor.db"
+  pool_size: 20
+  busy_timeout: 30000
+
+scheduler:
+  daily_scan_time: "02:00"
+  bank_match_time: "06:00"
+  report_day: 1
+  report_time: "08:00"
+  worker_threads: 16
+  batch_size: 500
+
+collection:
+  pre_due_days: 7
+  high_credit_levels: ["A", "B"]
+  low_credit_levels: ["C", "D"]
+  gentle_email_template: |
+    尊敬的{customer_name}：
+    您好！贵司合同{contract_no}项下付款 milestone "{description}"（金额：{amount}元）
+    将于{due_date}到期，请安排付款。感谢合作！
+  firm_letter_template: |
+    致：{customer_name}
+    关于合同{contract_no}项下付款里程碑"{description}"（金额：{amount}元），
+    将于{due_date}到期，请务必在到期日前完成付款。
+    如逾期未付，我司将按合同约定采取进一步措施，包括但不限于暂停新订单审批。
+
+escalation:
+  overdue_threshold_days: 15
+  notify_roles: ["sales_director", "legal"]
+  freeze_order_on_escalation: true
+
+credit:
+  initial_score: 80
+  score_on_time: 5
+  score_minor_late: -5
+  score_major_late: -15
+  downgrade_overdue_count: 3
+  downgrade_overdue_amount: 500000
+  level_thresholds:
+    A: 90
+    B: 75
+    C: 60
+    D: 0
+
+approval:
+  levels:
+    - level: 1
+      role: "sales_manager"
+      max_extension_days: 30
+      max_installment_count: 3
+    - level: 2
+      role: "sales_director"
+      max_extension_days: 90
+      max_installment_count: 6
+    - level: 3
+      role: "general_manager"
+      max_extension_days: 365
+      max_installment_count: 12
+
+report:
+  output_dir: "./contract_monitor/reports"
+  pdf_enabled: true
+  excel_enabled: true
+
+logging:
+  level: INFO
+  log_dir: "./contract_monitor/logs"
+  max_file_size_mb: 50
+  backup_count: 10
+
+email:
+  smtp_host: "smtp.example.com"
+  smtp_port: 587
+  sender: "contract-system@company.com"
+  use_tls: true
