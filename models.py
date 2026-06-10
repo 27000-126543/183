@@ -168,6 +168,22 @@ CREATE TABLE IF NOT EXISTS monthly_reports (
     excel_path TEXT
 );
 
+CREATE TABLE IF NOT EXISTS collection_worklists (
+    item_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    customer_name TEXT NOT NULL,
+    credit_level TEXT NOT NULL,
+    overdue_amount REAL NOT NULL DEFAULT 0.0,
+    contract_details TEXT DEFAULT '',
+    suggested_tactic TEXT DEFAULT '',
+    assigned_manager TEXT DEFAULT '',
+    deadline TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    processed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     log_id INTEGER PRIMARY KEY AUTOINCREMENT,
     operation_type TEXT NOT NULL,

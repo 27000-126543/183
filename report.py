@@ -83,6 +83,9 @@ def generate_monthly_report(year=None, month=None, config=None):
 
 
 def _compute_report_stats(start_date, end_date):
+    start_d = date.fromisoformat(start_date)
+    end_d = date.fromisoformat(end_date)
+
     total_payment_milestones = execute_query(
         "SELECT COUNT(*) as cnt FROM milestones "
         "WHERE milestone_type = 'payment' "
@@ -162,12 +165,11 @@ def _compute_report_stats(start_date, end_date):
 
     monthly_trend = []
     for i in range(6):
-        m_date = date.today() - timedelta(days=30 * (i + 1))
-        m_start = m_date.replace(day=1).isoformat()
-        if m_date.month == 12:
-            m_end = date(m_date.year + 1, 1, 1).isoformat()
-        else:
-            m_end = date(m_date.year, m_date.month + 1, 1).isoformat()
+        offset_months = i + 1
+        target = _month_offset(start_d, -offset_months)
+        m_start = target.isoformat()
+        m_end_month = _month_offset(target, 1)
+        m_end = m_end_month.isoformat()
 
         m_completed = execute_query(
             "SELECT COUNT(*) as cnt FROM milestones "
@@ -184,12 +186,59 @@ def _compute_report_stats(start_date, end_date):
             fetch_one=True
         )
         monthly_trend.append({
-            "month": f"{m_date.year}-{m_date.month:02d}",
+            "month": f"{target.year}-{target.month:02d}",
             "completed": m_completed["cnt"] or 0,
             "overdue": m_overdue["cnt"] or 0
         })
 
     monthly_trend.reverse()
+
+    customer_payment_analysis = execute_query(
+        "SELECT cu.customer_id, cu.customer_name, cu.credit_level, "
+        "COALESCE(ms_summary.sales_manager, '') as sales_manager, "
+        "COALESCE(ms_summary.month_planned, 0) as month_planned, "
+        "COALESCE(ms_summary.month_received, 0) as month_received, "
+        "COALESCE(ms_summary.month_overdue, 0) as month_overdue, "
+        "CASE WHEN COALESCE(ms_summary.month_planned, 0) > 0 "
+        "  THEN ROUND(COALESCE(ms_summary.month_received, 0) * 100.0 "
+        "    / ms_summary.month_planned, 2) "
+        "  ELSE 0 END as payment_rate "
+        "FROM customers cu "
+        "LEFT JOIN ("
+        "  SELECT m.customer_id, "
+        "  (SELECT c2.sales_manager FROM contracts c2 WHERE c2.customer_id = m.customer_id AND c2.status = 'active' LIMIT 1) as sales_manager, "
+        "  SUM(CASE WHEN m.planned_date >= ? AND m.planned_date < ? THEN m.amount ELSE 0 END) as month_planned, "
+        "  SUM(CASE WHEN m.actual_date >= ? AND m.actual_date < ? AND m.status = 'completed' THEN m.amount ELSE 0 END) as month_received, "
+        "  SUM(CASE WHEN m.planned_date >= ? AND m.planned_date < ? AND m.status = 'overdue' THEN m.amount ELSE 0 END) as month_overdue "
+        "  FROM milestones m WHERE m.milestone_type = 'payment' "
+        "  AND (m.planned_date >= ? AND m.planned_date < ? "
+        "       OR (m.actual_date >= ? AND m.actual_date < ?)) "
+        "  GROUP BY m.customer_id"
+        ") ms_summary ON cu.customer_id = ms_summary.customer_id "
+        "WHERE ms_summary.customer_id IS NOT NULL "
+        "ORDER BY month_overdue DESC",
+        [start_date, end_date, start_date, end_date, start_date, end_date,
+         start_date, end_date, start_date, end_date],
+        fetch_all=True
+    )
+
+    credit_changes = execute_query(
+        "SELECT ch.customer_id, ch.old_level, ch.new_level, ch.reason "
+        "FROM credit_history ch "
+        "WHERE ch.change_date >= ? AND ch.change_date < ? "
+        "ORDER BY ch.change_date DESC",
+        [start_date, end_date],
+        fetch_all=True
+    )
+    credit_change_map = {}
+    for ch in credit_changes:
+        cid = ch["customer_id"]
+        if cid not in credit_change_map:
+            credit_change_map[cid] = []
+        credit_change_map[cid].append(f"{ch['old_level']}->{ch['new_level']}")
+
+    for cp in customer_payment_analysis:
+        cp["credit_change"] = "; ".join(credit_change_map.get(cp["customer_id"], ["-"]))
 
     planned_details = execute_query(
         "SELECT m.contract_no, cu.customer_name, m.description, "
@@ -227,6 +276,48 @@ def _compute_report_stats(start_date, end_date):
         fetch_all=True
     )
 
+    manager_analysis = execute_query(
+        "SELECT c.sales_manager, "
+        "COUNT(DISTINCT cu.customer_id) as customer_count, "
+        "SUM(CASE WHEN cu.order_frozen = 1 THEN 1 ELSE 0 END) as frozen_count, "
+        "COALESCE(SUM(ms_summary.month_planned), 0) as month_planned, "
+        "COALESCE(SUM(ms_summary.month_received), 0) as month_received, "
+        "COALESCE(SUM(ms_summary.month_overdue), 0) as month_overdue, "
+        "CASE WHEN COALESCE(SUM(ms_summary.month_planned), 0) > 0 "
+        "  THEN ROUND(COALESCE(SUM(ms_summary.month_received), 0) * 100.0 "
+        "    / SUM(ms_summary.month_planned), 2) "
+        "  ELSE 0 END as payment_rate, "
+        "COALESCE(wl_done.done_count, 0) as wl_done_count, "
+        "COALESCE(wl_total.total_count, 0) as wl_total_count, "
+        "CASE WHEN COALESCE(wl_total.total_count, 0) > 0 "
+        "  THEN ROUND(COALESCE(wl_done.done_count, 0) * 100.0 / wl_total.total_count, 2) "
+        "  ELSE 0 END as collection_rate "
+        "FROM customers cu "
+        "JOIN contracts c ON cu.customer_id = c.customer_id AND c.status = 'active' "
+        "LEFT JOIN ("
+        "  SELECT m.customer_id, "
+        "  SUM(CASE WHEN m.planned_date >= ? AND m.planned_date < ? THEN m.amount ELSE 0 END) as month_planned, "
+        "  SUM(CASE WHEN m.actual_date >= ? AND m.actual_date < ? AND m.status = 'completed' THEN m.amount ELSE 0 END) as month_received, "
+        "  SUM(CASE WHEN m.planned_date >= ? AND m.planned_date < ? AND m.status = 'overdue' THEN m.amount ELSE 0 END) as month_overdue "
+        "  FROM milestones m WHERE m.milestone_type = 'payment' "
+        "  AND (m.planned_date >= ? AND m.planned_date < ? "
+        "       OR (m.actual_date >= ? AND m.actual_date < ?)) "
+        "  GROUP BY m.customer_id"
+        ") ms_summary ON cu.customer_id = ms_summary.customer_id "
+        "LEFT JOIN ("
+        "  SELECT assigned_manager, COUNT(*) as done_count FROM collection_worklists WHERE status = 'done' GROUP BY assigned_manager"
+        ") wl_done ON c.sales_manager = wl_done.assigned_manager "
+        "LEFT JOIN ("
+        "  SELECT assigned_manager, COUNT(*) as total_count FROM collection_worklists GROUP BY assigned_manager"
+        ") wl_total ON c.sales_manager = wl_total.assigned_manager "
+        "WHERE ms_summary.customer_id IS NOT NULL "
+        "GROUP BY c.sales_manager "
+        "ORDER BY month_overdue DESC",
+        [start_date, end_date, start_date, end_date, start_date, end_date,
+         start_date, end_date, start_date, end_date],
+        fetch_all=True
+    )
+
     return {
         "on_time_rate": round(on_time_rate, 2),
         "avg_overdue_days": round(avg_overdue_days, 1),
@@ -239,10 +330,20 @@ def _compute_report_stats(start_date, end_date):
         "overdue_amount": overdue["total"] or 0,
         "top_overdue_customers": top_overdue_customers,
         "monthly_trend": monthly_trend,
+        "customer_payment_analysis": customer_payment_analysis,
+        "manager_payment_analysis": manager_analysis,
         "planned_details": planned_details,
         "actual_details": actual_details,
         "overdue_details": overdue_details,
     }
+
+
+def _month_offset(base_date, months):
+    month = base_date.month - 1 + months
+    year = base_date.year + month // 12
+    month = month % 12 + 1
+    day = min(base_date.day, 28)
+    return date(year, month, day)
 
 
 def _generate_pdf_report(stats, year, month, output_dir):
@@ -533,8 +634,71 @@ def _generate_excel_report(stats, year, month, output_dir):
         for idx, width in enumerate(detail_col_widths, 1):
             ws_detail.column_dimensions[chr(64 + idx)].width = width
 
+    customer_analysis = stats.get("customer_payment_analysis", [])
+    if customer_analysis:
+        ws_ca = wb.create_sheet("Customer Payment Analysis")
+        ca_headers = ["Customer", "Credit Level", "Sales Manager",
+                      "Month Planned", "Month Received", "Month Overdue",
+                      "Payment Rate %", "Credit Change"]
+        ws_ca.append(ca_headers)
+        for cell in ws_ca[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+        for cp in customer_analysis:
+            ws_ca.append([
+                cp.get("customer_name", ""),
+                cp.get("credit_level", ""),
+                cp.get("sales_manager", ""),
+                cp.get("month_planned", 0),
+                cp.get("month_received", 0),
+                cp.get("month_overdue", 0),
+                cp.get("payment_rate", 0),
+                cp.get("credit_change", "-"),
+            ])
+            for cell in ws_ca[ws_ca.max_row]:
+                cell.border = thin_border
+
+        ca_widths = [20, 12, 14, 14, 14, 14, 14, 20]
+        for idx, width in enumerate(ca_widths, 1):
+            ws_ca.column_dimensions[chr(64 + idx)].width = width
+
+    manager_analysis = stats.get("manager_payment_analysis", [])
+    if manager_analysis:
+        ws_ma = wb.create_sheet("Manager Payment Analysis")
+        ma_headers = ["Sales Manager", "Customer Count", "Frozen Count",
+                      "Month Planned", "Month Received", "Month Overdue",
+                      "Payment Rate %", "Collection Rate %"]
+        ws_ma.append(ma_headers)
+        for cell in ws_ma[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+        for ma in manager_analysis:
+            ws_ma.append([
+                ma.get("sales_manager", ""),
+                ma.get("customer_count", 0),
+                ma.get("frozen_count", 0),
+                ma.get("month_planned", 0),
+                ma.get("month_received", 0),
+                ma.get("month_overdue", 0),
+                ma.get("payment_rate", 0),
+                ma.get("collection_rate", 0),
+            ])
+            for cell in ws_ma[ws_ma.max_row]:
+                cell.border = thin_border
+
+        ma_widths = [14, 14, 12, 14, 14, 14, 14, 14]
+        for idx, width in enumerate(ma_widths, 1):
+            ws_ma.column_dimensions[chr(64 + idx)].width = width
+
     for ws in wb.worksheets:
-        if ws.title in ("Planned Payments", "Actual Receipts", "Overdue Unpaid"):
+        if ws.title in ("Planned Payments", "Actual Receipts", "Overdue Unpaid",
+                         "Customer Payment Analysis", "Manager Payment Analysis"):
             continue
         for row in ws.iter_rows():
             for cell in row:
